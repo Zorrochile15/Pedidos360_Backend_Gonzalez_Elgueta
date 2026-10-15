@@ -16,6 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import cl.duoc.pedidos360.backend.entity.Pedido;
 import cl.duoc.pedidos360.backend.repository.PedidoRepository;
+import cl.duoc.pedidos360.backend.service.PublicadorMensajesService;
 
 @RestController
 @RequestMapping("/api")
@@ -24,6 +25,9 @@ public class PedidoController {
 
     @Autowired
     private PedidoRepository pedidoRepository;
+
+    @Autowired
+    private PublicadorMensajesService publicadorMensajes;
 
     @GetMapping("/admin/pedidos")
     public ResponseEntity<List<Pedido>> getAllPedidos() {
@@ -45,13 +49,19 @@ public class PedidoController {
 
     @PostMapping("/locales/pedidos")
     public ResponseEntity<Pedido> createPedido(
-        @RequestBody Pedido pedido
+        @RequestBody Pedido pedido,
+        @RequestParam(defaultValue = "NORMAL") String prioridad
     ) {
         pedido.setFechaCreacion(LocalDateTime.now());
-        pedido.setEstado("PENDIENTE");
+        if (pedido.getEstado() == null || pedido.getEstado().isEmpty()) {
+            pedido.setEstado("PENDIENTE");
+        }
+
+        Pedido nuevoPedido = pedidoRepository.save(pedido);
+        publicadorMensajes.publicarPedido(nuevoPedido, prioridad);
 
         return new ResponseEntity<>(
-            pedidoRepository.save(pedido),
+            nuevoPedido,
             HttpStatus.CREATED
         );
     }

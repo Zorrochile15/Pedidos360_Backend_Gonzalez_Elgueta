@@ -19,7 +19,10 @@ public class PublicadorMensajesService {
     }
 
     public void publicarPedido(Pedido pedido, String prioridad) {
-        String nivelPrioridad = (prioridad != null) ? prioridad : "NORMAL";
+
+        String nivelPrioridad = (prioridad == null || prioridad.isBlank())
+                ? "NORMAL"
+                : prioridad.trim().toUpperCase();
 
         SnsNotification<Pedido> notificacion = SnsNotification.builder(pedido)
                 .header("prioridad", nivelPrioridad)

@@ -1,12 +1,25 @@
 package cl.duoc.pedidos360.admin.config;
 
+import cl.duoc.pedidos360.admin.security.CognitoTokenValidator;
+
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.convert.converter.Converter;
+
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
+
+import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
+import org.springframework.security.oauth2.core.OAuth2TokenValidator;
+
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.JwtDecoders;
+import org.springframework.security.oauth2.jwt.JwtValidators;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
 
@@ -16,6 +29,13 @@ import java.util.List;
 
 @Configuration
 public class SecurityConfig {
+
+    @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}")
+    private String issuerUri;
+
+    @Value("${cognito.client-id}")
+    private String clientId;
+
 
     @Bean
     public SecurityFilterChain securityFilterChain(
@@ -40,6 +60,36 @@ public class SecurityConfig {
                 );
 
         return http.build();
+    }
+
+
+    @Bean
+    public JwtDecoder jwtDecoder() {
+
+        JwtDecoder decoder =
+                JwtDecoders.fromIssuerLocation(issuerUri);
+
+        if (decoder instanceof NimbusJwtDecoder nimbusJwtDecoder) {
+
+            OAuth2TokenValidator<Jwt> issuerValidator =
+                    JwtValidators.createDefaultWithIssuer(
+                            issuerUri
+                    );
+
+            OAuth2TokenValidator<Jwt> cognitoValidator =
+                    new CognitoTokenValidator(
+                            clientId
+                    );
+
+            nimbusJwtDecoder.setJwtValidator(
+                    new DelegatingOAuth2TokenValidator<>(
+                            issuerValidator,
+                            cognitoValidator
+                    )
+            );
+        }
+
+        return decoder;
     }
 
 

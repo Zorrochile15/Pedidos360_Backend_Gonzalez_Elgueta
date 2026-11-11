@@ -16,6 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import cl.duoc.pedidos360.backend.entity.Pedido;
 import cl.duoc.pedidos360.backend.repository.PedidoRepository;
+import cl.duoc.pedidos360.backend.service.KinesisProducerService;
 import cl.duoc.pedidos360.backend.service.PublicadorMensajesService;
 
 @RestController
@@ -28,6 +29,9 @@ public class PedidoController {
 
     @Autowired
     private PublicadorMensajesService publicadorMensajes;
+
+    @Autowired
+    private KinesisProducerService kinesisProducer;
 
     @GetMapping("/admin/pedidos")
     public ResponseEntity<List<Pedido>> getAllPedidos() {
@@ -59,6 +63,7 @@ public class PedidoController {
 
         Pedido nuevoPedido = pedidoRepository.save(pedido);
         publicadorMensajes.publicarPedido(nuevoPedido, prioridad);
+        kinesisProducer.publicarEventoPedido(nuevoPedido);
 
         return new ResponseEntity<>(
             nuevoPedido,

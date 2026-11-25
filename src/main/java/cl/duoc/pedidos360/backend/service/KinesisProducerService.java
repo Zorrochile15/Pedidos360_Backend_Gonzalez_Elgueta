@@ -2,11 +2,14 @@ package cl.duoc.pedidos360.backend.service;
 
 import cl.duoc.pedidos360.backend.dto.EventoStreamDto;
 import cl.duoc.pedidos360.backend.entity.Pedido;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.kinesis.KinesisClient;
 import software.amazon.awssdk.services.kinesis.model.PutRecordRequest;
@@ -25,7 +28,8 @@ import java.util.UUID;
 @Service
 public class KinesisProducerService {
 
-    private static final Logger log = LoggerFactory.getLogger(KinesisProducerService.class);
+    private static final Logger log =
+            LoggerFactory.getLogger(KinesisProducerService.class);
 
     private final KinesisClient kinesisClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -44,11 +48,15 @@ public class KinesisProducerService {
     }
 
     public Map<String, String> publicarEventoPedido(Pedido pedido) {
-        Long localId = (pedido.getLocal() != null && pedido.getLocal().getId() != null)
+
+        Long localId = (pedido.getLocal() != null
+                && pedido.getLocal().getId() != null)
                 ? pedido.getLocal().getId()
                 : 0L;
 
-        int cantidadSimulada = "ERROR_CANTIDAD".equalsIgnoreCase(pedido.getEstado()) ? 0 : 1;
+        int cantidadSimulada =
+                "ERROR_CANTIDAD".equalsIgnoreCase(pedido.getEstado())
+                        ? 0 : 1;
 
         EventoStreamDto dto = new EventoStreamDto(
                 UUID.randomUUID().toString(),
@@ -62,7 +70,9 @@ public class KinesisProducerService {
         );
 
         String partitionKey = "local-" + localId;
-        Map<String, String> resPedidos = enviarAlStream(streamPedidos, partitionKey, dto);
+
+        Map<String, String> resPedidos =
+                enviarAlStream(streamPedidos, partitionKey, dto);
 
         EventoStreamDto dtoAnalitica = new EventoStreamDto(
                 UUID.randomUUID().toString(),
@@ -74,61 +84,116 @@ public class KinesisProducerService {
                 "ANALITICA_DEMANDA",
                 LocalDateTime.now().toString()
         );
-        enviarAlStream(streamAnalitica, partitionKey, dtoAnalitica);
+
+        enviarAlStream(
+                streamAnalitica, partitionKey, dtoAnalitica);
 
         return resPedidos;
     }
 
-    public Map<String, String> enviarAlStream(String streamName, String partitionKey, EventoStreamDto dto) {
-        try {
-            String json = objectMapper.writeValueAsString(dto);
-            PutRecordResponse response = kinesisClient.putRecord(PutRecordRequest.builder()
-                    .streamName(streamName)
-                    .partitionKey(partitionKey)
-                    .data(SdkBytes.fromString(json, StandardCharsets.UTF_8))
-                    .build());
+    public Map<String, String> enviarAlStream(
+            String streamName,
+            String partitionKey,
+            EventoStreamDto dto) {
 
-            log.info("Kinesis PutRecord -> stream={}, eventoId={}, key={}, shard={}, seq={}",
-                    streamName, dto.getEventoId(), partitionKey, response.shardId(), response.sequenceNumber());
+        try {
+
+            String json = objectMapper.writeValueAsString(dto);
+
+            PutRecordResponse response =
+                    kinesisClient.putRecord(
+                            PutRecordRequest.builder()
+                                    .streamName(streamName)
+                                    .partitionKey(partitionKey)
+                                    .data(SdkBytes.fromString(
+                                            json, StandardCharsets.UTF_8))
+                                    .build());
+
+            log.info(
+                    "Kinesis PutRecord -> stream={}, eventoId={}, key={}, shard={}, seq={}",
+                    streamName,
+                    dto.getEventoId(),
+                    partitionKey,
+                    response.shardId(),
+                    response.sequenceNumber());
 
             return Map.of(
                     "eventoId", dto.getEventoId(),
                     "shardId", response.shardId(),
                     "sequenceNumber", response.sequenceNumber()
             );
+
         } catch (Exception e) {
-            log.error("Error publicando en Kinesis stream={} -> causa={}", streamName, e.getMessage());
-            return Map.of("error", e.getMessage());
+
+            log.error(
+                    "Error publicando en Kinesis stream={} -> causa={}",
+                    streamName, e.getMessage());
+
+            return Map.of("error", e.toString());
         }
     }
 
-    public int publicarLoteEventos(String streamName, List<EventoStreamDto> eventos) {
+    public int publicarLoteEventos(
+            String streamName,
+            List<EventoStreamDto> eventos) {
+
         try {
-            List<PutRecordsRequestEntry> entries = new ArrayList<>();
+
+            List<PutRecordsRequestEntry> entries =
+                    new ArrayList<>();
+
             for (EventoStreamDto dto : eventos) {
+
                 String json = objectMapper.writeValueAsString(dto);
-                entries.add(PutRecordsRequestEntry.builder()
-                        .partitionKey("local-" + (dto.getLocalId() != null ? dto.getLocalId() : 0))
-                        .data(SdkBytes.fromString(json, StandardCharsets.UTF_8))
-                        .build());
+
+                entries.add(
+                        PutRecordsRequestEntry.builder()
+                                .partitionKey(
+                                        "local-" + (dto.getLocalId() != null
+                                                ? dto.getLocalId() : 0))
+                                .data(SdkBytes.fromString(
+                                        json, StandardCharsets.UTF_8))
+                                .build());
             }
-            PutRecordsResponse response = kinesisClient.putRecords(PutRecordsRequest.builder()
-                    .streamName(streamName)
-                    .records(entries)
-                    .build());
+
+            PutRecordsResponse response =
+                    kinesisClient.putRecords(
+                            PutRecordsRequest.builder()
+                                    .streamName(streamName)
+                                    .records(entries)
+                                    .build());
 
             if (response.failedRecordCount() > 0) {
-                log.warn("Envio por lote con registros fallidos -> fallidos={}", response.failedRecordCount());
+
+                log.warn(
+                        "Envio por lote con registros fallidos -> fallidos={}",
+                        response.failedRecordCount());
             }
+
             return response.failedRecordCount();
+
         } catch (Exception e) {
-            log.error("Error en envio por lote Kinesis: {}", e.getMessage());
+
+            log.error(
+                    "Error en envio por lote Kinesis: {}",
+                    e.getMessage());
+
             return eventos.size();
         }
     }
 
-    public void enviarAStreamFallidos(String payloadOriginal, String eventoId, String causa, int intentos) {
+    // Publicacion confirmada de eventos fallidos.
+    // Si falla, se propaga la excepcion para impedir
+    // que KCL avance el checkpoint.
+
+    public void enviarAStreamFallidos(
+            String payloadOriginal,
+            String eventoId,
+            String causa,
+            int intentos) {
+
         try {
+
             Map<String, Object> deadLetterEvent = Map.of(
                     "eventoId", eventoId,
                     "causa", causa,
@@ -136,15 +201,38 @@ public class KinesisProducerService {
                     "payload", payloadOriginal,
                     "timestamp", LocalDateTime.now().toString()
             );
-            String json = objectMapper.writeValueAsString(deadLetterEvent);
-            kinesisClient.putRecord(PutRecordRequest.builder()
-                    .streamName(streamFallidos)
-                    .partitionKey(eventoId)
-                    .data(SdkBytes.fromString(json, StandardCharsets.UTF_8))
-                    .build());
-            log.error("Evento enviado a Stream de Fallidos -> id={}, intentos={}, causa={}", eventoId, intentos, causa);
+
+            String json =
+                    objectMapper.writeValueAsString(deadLetterEvent);
+
+            PutRecordResponse response =
+                    kinesisClient.putRecord(
+                            PutRecordRequest.builder()
+                                    .streamName(streamFallidos)
+                                    .partitionKey(eventoId)
+                                    .data(SdkBytes.fromString(
+                                            json, StandardCharsets.UTF_8))
+                                    .build());
+
+            log.error(
+                    "Evento enviado a Stream de Fallidos -> id={}, intentos={}, causa={}, shard={}, seq={}",
+                    eventoId,
+                    intentos,
+                    causa,
+                    response.shardId(),
+                    response.sequenceNumber());
+
         } catch (Exception e) {
-            log.error("Fallo critico enviando a stream de fallidos: {}", e.getMessage());
+
+            log.error(
+                    "Fallo critico enviando a stream de fallidos -> id={}",
+                    eventoId,
+                    e);
+
+            throw new IllegalStateException(
+                    "No se pudo publicar el evento fallido: "
+                            + eventoId,
+                    e);
         }
     }
 }

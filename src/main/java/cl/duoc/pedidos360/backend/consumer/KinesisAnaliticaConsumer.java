@@ -2,34 +2,54 @@ package cl.duoc.pedidos360.backend.consumer;
 
 import cl.duoc.pedidos360.backend.dto.EventoStreamDto;
 import cl.duoc.pedidos360.backend.service.StreamAdminService;
+import cl.duoc.pedidos360.backend.service.KinesisProducerService;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.annotation.PreDestroy;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
-import software.amazon.awssdk.services.kinesis.KinesisClient;
-import software.amazon.awssdk.services.kinesis.model.ExpiredIteratorException;
-import software.amazon.awssdk.services.kinesis.model.GetRecordsRequest;
-import software.amazon.awssdk.services.kinesis.model.GetRecordsResponse;
-import software.amazon.awssdk.services.kinesis.model.GetShardIteratorRequest;
-import software.amazon.awssdk.services.kinesis.model.ListShardsRequest;
-import software.amazon.awssdk.services.kinesis.model.Record;
-import software.amazon.awssdk.services.kinesis.model.Shard;
-import software.amazon.awssdk.services.kinesis.model.ShardIteratorType;
 
-import java.util.List;
-import java.util.Map;
+import software.amazon.awssdk.services.kinesis.KinesisAsyncClient;
+import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchAsyncClient;
+
+import software.amazon.kinesis.common.ConfigsBuilder;
+import software.amazon.kinesis.common.InitialPositionInStream;
+import software.amazon.kinesis.common.InitialPositionInStreamExtended;
+import software.amazon.kinesis.coordinator.Scheduler;
+import software.amazon.kinesis.exceptions.ShutdownException;
+import software.amazon.kinesis.lifecycle.events.*;
+import software.amazon.kinesis.processor.ShardRecordProcessor;
+import software.amazon.kinesis.processor.RecordProcessorCheckpointer;
+import software.amazon.kinesis.processor.SingleStreamTracker;
+import software.amazon.kinesis.retrieval.KinesisClientRecord;
+import software.amazon.kinesis.retrieval.polling.PollingConfig;
+
+import java.nio.charset.StandardCharsets;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class KinesisAnaliticaConsumer {
 
-    private static final Logger log = LoggerFactory.getLogger(KinesisAnaliticaConsumer.class);
+    private static final Logger log =
+            LoggerFactory.getLogger(KinesisAnaliticaConsumer.class);
 
-    private final KinesisClient kinesisClient;
+    private final KinesisAsyncClient kinesisClient;
+    private final DynamoDbAsyncClient dynamoClient;
+    private final CloudWatchAsyncClient cloudWatchClient;
     private final StreamAdminService adminService;
+    private final KinesisProducerService producerService;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${aws.kinesis.stream.analitica}")
@@ -38,48 +58,357 @@ public class KinesisAnaliticaConsumer {
     @Value("${aws.kinesis.consumer.grupo-inventario}")
     private String grupoInventario;
 
-    private final Map<String, String> iteradores = new ConcurrentHashMap<>();
-    private final Set<String> procesados = ConcurrentHashMap.newKeySet();
+    private final Set<String> procesados =
+            ConcurrentHashMap.newKeySet();
 
-    public KinesisAnaliticaConsumer(KinesisClient kinesisClient, StreamAdminService adminService) {
+    private volatile Scheduler scheduler;
+
+    public KinesisAnaliticaConsumer(
+            KinesisAsyncClient kinesisClient,
+            DynamoDbAsyncClient dynamoClient,
+            CloudWatchAsyncClient cloudWatchClient,
+            StreamAdminService adminService,
+            KinesisProducerService producerService) {
+
         this.kinesisClient = kinesisClient;
+        this.dynamoClient = dynamoClient;
+        this.cloudWatchClient = cloudWatchClient;
         this.adminService = adminService;
+        this.producerService = producerService;
     }
 
-    @Scheduled(fixedDelay = 5000)
-    public void consumirAnaliticaInventario() {
-        try {
-            List<Shard> shards = kinesisClient.listShards(ListShardsRequest.builder().streamName(streamAnalitica).build()).shards();
-            for (Shard shard : shards) {
-                String shardId = shard.shardId();
-                String iterator = iteradores.computeIfAbsent(shardId, id -> kinesisClient.getShardIterator(
-                        GetShardIteratorRequest.builder()
-                                .streamName(streamAnalitica)
-                                .shardId(id)
-                                .shardIteratorType(ShardIteratorType.TRIM_HORIZON)
-                                .build()).shardIterator());
+    @EventListener(ApplicationReadyEvent.class)
+    public void iniciarConsumidor() {
 
-                GetRecordsResponse response = kinesisClient.getRecords(GetRecordsRequest.builder()
-                        .shardIterator(iterator)
-                        .limit(25)
-                        .build());
+        String workerId =
+                grupoInventario + "-" + UUID.randomUUID();
 
-                iteradores.put(shardId, response.nextShardIterator());
-                long lagMs = response.millisBehindLatest() != null ? response.millisBehindLatest() : 0L;
+        SingleStreamTracker streamTracker =
+                new SingleStreamTracker(
+                        streamAnalitica,
+                        InitialPositionInStreamExtended
+                                .newInitialPosition(
+                                        InitialPositionInStream.TRIM_HORIZON)
+                );
 
-                for (Record record : response.records()) {
-                    EventoStreamDto dto = objectMapper.readValue(record.data().asUtf8String(), EventoStreamDto.class);
-                    if (procesados.add(dto.getEventoId())) {
-                        log.info("[{}] Analitica procesada -> id={}, localId={}, cantidad={}, shard={}",
-                                grupoInventario, dto.getEventoId(), dto.getLocalId(), dto.getCantidad(), shardId);
-                    }
-                    adminService.registrarCheckpoint(grupoInventario, shardId, record.sequenceNumber(), lagMs);
+        ConfigsBuilder configs = new ConfigsBuilder(
+                streamTracker,
+                grupoInventario,
+                kinesisClient,
+                dynamoClient,
+                cloudWatchClient,
+                workerId,
+                () -> new ProcesadorAnalitica(workerId)
+        );
+
+        scheduler = new Scheduler(
+                configs.checkpointConfig(),
+                configs.coordinatorConfig(),
+                configs.leaseManagementConfig(),
+                configs.lifecycleConfig(),
+                configs.metricsConfig(),
+                configs.processorConfig(),
+                configs.retrievalConfig()
+                        .retrievalSpecificConfig(
+                                new PollingConfig(
+                                        streamAnalitica,
+                                        kinesisClient)
+                                        .maxRecords(25))
+        );
+
+        Thread thread = new Thread(scheduler);
+
+        thread.setName(workerId);
+        thread.setDaemon(true);
+        thread.start();
+
+        log.info(
+                "[{}] Worker KCL iniciado -> worker={}, stream={}",
+                grupoInventario,
+                workerId,
+                streamAnalitica);
+    }
+
+    private class ProcesadorAnalitica
+            implements ShardRecordProcessor {
+
+        private final String workerId;
+
+        private String shardId;
+        private boolean bloqueado = false;
+
+        public ProcesadorAnalitica(String workerId) {
+
+            this.workerId = workerId;
+        }
+
+        @Override
+        public void initialize(InitializationInput input) {
+
+            shardId = input.shardId();
+
+            log.info(
+                    "[{}] SHARD ASIGNADO -> worker={}, shard={}, checkpoint={}",
+                    grupoInventario,
+                    workerId,
+                    shardId,
+                    input.extendedSequenceNumber());
+        }
+
+        @Override
+        public void processRecords(ProcessRecordsInput input) {
+
+            if (bloqueado || input.records().isEmpty()) {
+                return;
+            }
+
+            long lagMs = input.millisBehindLatest() != null
+                    ? input.millisBehindLatest() : 0L;
+
+            try {
+
+                String ultimaSecuencia = null;
+
+                for (KinesisClientRecord record : input.records()) {
+
+                    procesarRegistro(record, workerId, shardId);
+
+                    ultimaSecuencia = record.sequenceNumber();
+                }
+
+                // Checkpoint persistente en DynamoDB
+                guardarCheckpoint(input.checkpointer());
+
+                log.info(
+                        "[{}] CHECKPOINT DYNAMODB -> worker={}, shard={}, seq={}, lagMs={}",
+                        grupoInventario,
+                        workerId,
+                        shardId,
+                        ultimaSecuencia,
+                        lagMs);
+
+                // Registro para el microservicio administrador
+                try {
+
+                    adminService.registrarCheckpoint(
+                            grupoInventario,
+                            shardId,
+                            ultimaSecuencia,
+                            lagMs);
+
+                } catch (Exception e) {
+
+                    log.warn(
+                            "Error actualizando administrador: {}",
+                            e.getMessage());
+                }
+
+            } catch (ShutdownException e) {
+
+                bloqueado = true;
+
+                log.warn(
+                        "[{}] Worker perdio el lease -> shard={}",
+                        grupoInventario,
+                        shardId);
+
+            } catch (Exception e) {
+
+                bloqueado = true;
+
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+
+                log.error(
+                        "[{}] Procesamiento detenido sin avanzar checkpoint -> shard={}",
+                        grupoInventario,
+                        shardId,
+                        e);
+
+                if (scheduler != null) {
+                    scheduler.startGracefulShutdown();
                 }
             }
-        } catch (ExpiredIteratorException e) {
-            iteradores.clear();
+        }
+
+        @Override
+        public void leaseLost(LeaseLostInput input) {
+
+            bloqueado = true;
+
+            log.warn(
+                    "[{}] SHARD LIBERADO -> worker={}, shard={}",
+                    grupoInventario,
+                    workerId,
+                    shardId);
+        }
+
+        @Override
+        public void shardEnded(ShardEndedInput input) {
+
+            if (bloqueado) {
+
+                throw new IllegalStateException(
+                        "Shard con procesamiento incompleto");
+            }
+
+            try {
+
+                guardarCheckpoint(input.checkpointer());
+
+                log.info(
+                        "[{}] SHARD FINALIZADO -> shard={}",
+                        grupoInventario,
+                        shardId);
+
+            } catch (Exception e) {
+
+                throw new IllegalStateException(
+                        "No se pudo finalizar el shard", e);
+            }
+        }
+
+        @Override
+        public void shutdownRequested(
+                ShutdownRequestedInput input) {
+
+            if (!bloqueado) {
+
+                try {
+
+                    guardarCheckpoint(input.checkpointer());
+
+                } catch (Exception e) {
+
+                    log.warn(
+                            "Error guardando checkpoint final", e);
+                }
+            }
+
+            log.info(
+                    "[{}] Worker detenido -> worker={}, shard={}",
+                    grupoInventario,
+                    workerId,
+                    shardId);
+        }
+    }
+
+    private void procesarRegistro(
+            KinesisClientRecord record,
+            String workerId,
+            String shardId) {
+
+        String payload = StandardCharsets.UTF_8
+                .decode(record.data().asReadOnlyBuffer())
+                .toString();
+
+        String seq = record.sequenceNumber();
+
+        EventoStreamDto dto;
+
+        try {
+
+            dto = objectMapper.readValue(
+                    payload,
+                    EventoStreamDto.class);
+
+        } catch (JsonProcessingException e) {
+
+            log.error(
+                    "[{}] JSON corrupto -> seq={}",
+                    grupoInventario,
+                    seq);
+
+            producerService.enviarAStreamFallidos(
+                    payload,
+                    seq,
+                    "JSON malformado en analitica: " + e.getMessage(),
+                    1);
+
+            return;
+        }
+
+        if (dto == null) {
+
+            producerService.enviarAStreamFallidos(
+                    payload,
+                    seq,
+                    "Evento de analitica nulo",
+                    1);
+
+            return;
+        }
+
+        String eventoId = dto.getEventoId() != null
+                ? dto.getEventoId()
+                : shardId + ":" + seq;
+
+        // Control local de duplicados
+        if (!procesados.add(eventoId)) {
+
+            log.warn(
+                    "[{}] Evento duplicado ignorado -> id={}, shard={}",
+                    grupoInventario,
+                    eventoId,
+                    shardId);
+
+            return;
+        }
+
+        log.info(
+                "[{}] Analitica procesada -> id={}, localId={}, cantidad={}, worker={}, shard={}, seq={}",
+                grupoInventario,
+                eventoId,
+                dto.getLocalId(),
+                dto.getCantidad(),
+                workerId,
+                shardId,
+                seq);
+    }
+
+    private void guardarCheckpoint(
+            RecordProcessorCheckpointer checkpointer)
+            throws Exception {
+
+        for (int intento = 1; intento <= 3; intento++) {
+
+            try {
+
+                checkpointer.checkpoint();
+
+                return;
+
+            } catch (ShutdownException e) {
+
+                throw e;
+
+            } catch (Exception e) {
+
+                if (intento == 3) {
+                    throw e;
+                }
+
+                Thread.sleep(500L * intento);
+            }
+        }
+    }
+
+    @PreDestroy
+    public void detenerConsumidor() {
+
+        if (scheduler == null) {
+            return;
+        }
+
+        try {
+
+            scheduler.startGracefulShutdown()
+                    .get(20, TimeUnit.SECONDS);
+
         } catch (Exception e) {
-            log.debug("Esperando stream analitica: {}", e.getMessage());
+
+            scheduler.shutdown();
         }
     }
 }
